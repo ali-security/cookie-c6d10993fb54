@@ -1,7 +1,5 @@
 language: node_js
 node_js:
-  - "0.6"
-  - "0.8"
   - "0.10"
   - "0.12"
   - "1.8"
@@ -17,7 +15,7 @@ node_js:
   - "11.15"
   - "12.16"
   - "13.13"
-dist: trusty
+dist: xenial
 env:
   global:
     # Suppress Node.js 0.6 compile warnings
@@ -25,11 +23,57 @@ env:
 cache:
   directories:
     - node_modules
+matrix:
+  include:
+    # Node 0.6 and 0.8 ship an npm that can only negotiate TLS 1.0, which no
+    # registry accepts any more, and nvm has no prebuilt Node 0.6 binary for
+    # linux-x64. Both legacy legs therefore install the dependency tree with
+    # Node 0.10's npm and run the whole suite with the legacy runtime itself:
+    # 0.8.28 from the official tarball, 0.6.21 compiled from source.
+    - node_js: "0.10"
+      env: SEAL_LEGACY_NODE=0.8 SEAL_LEGACY_NODE_FULL=0.8.28
+    - node_js: "0.10"
+      env: SEAL_LEGACY_NODE=0.6 SEAL_LEGACY_NODE_FULL=0.6.21
+      addons:
+        apt:
+          packages:
+            - gcc-4.8
+            - g++-4.8
+            - python2.7
 before_install:
+  # Resolve devDependencies against the release-era registry snapshot
+  - "npm config set registry https://:2020-04-22T03%3A23%3A57.297Z@time-machines-npm.sealsecurity.io/"
+  # Provide the legacy runtime this leg runs its tests on
+  - |
+    if [ "$SEAL_LEGACY_NODE_FULL" = "0.8.28" ]; then
+      curl -sSL https://nodejs.org/dist/v0.8.28/node-v0.8.28-linux-x64.tar.gz | tar -xz -C "$HOME"
+      export SEAL_LEGACY_BIN="$HOME/node-v0.8.28-linux-x64/bin"
+      "$SEAL_LEGACY_BIN/node" --version
+    fi
+  - |
+    if [ "$SEAL_LEGACY_NODE_FULL" = "0.6.21" ]; then
+      mkdir -p "$HOME/py2"
+      ln -sf /usr/bin/python2.7 "$HOME/py2/python"
+      export PATH="$HOME/py2:$PATH"
+      export SEAL_LEGACY_BIN="$HOME/node06/bin"
+      curl -sSL https://nodejs.org/dist/v0.6.21/node-v0.6.21.tar.gz | tar -xz -C /tmp
+      # The redirect keeps V8's -Wnarrowing spam from blowing Travis's 4MB log
+      # limit, which terminates the job; a failed compile prints the log tail
+      # and leaves no node binary, so the version check below fails the step
+      (
+        set -e
+        cd /tmp/node-v0.6.21
+        export CC=gcc-4.8 CXX=g++-4.8
+        ./configure --prefix="$HOME/node06" --without-ssl
+        make -j2
+        make install
+      ) > /tmp/node06.log 2>&1 || { tail -100 /tmp/node06.log; false; }
+      "$SEAL_LEGACY_BIN/node" --version
+    fi
   - |
     # Setup utility functions
     function node_version_lt () {
-      [[ "$(v "$TRAVIS_NODE_VERSION")" -lt "$(v "${1}")" ]]
+      [[ "$(v "${SEAL_LEGACY_NODE:-$TRAVIS_NODE_VERSION}")" -lt "$(v "${1}")" ]]
     }
     function npm_module_installed () {
       npm -lsp ls | grep -Fq "$(pwd)/node_modules/${1}:${1}@"
@@ -98,18 +142,14 @@ before_script:
     npm -s ls ||:
 script:
   - |
-    # Run test script, depending on nyc install
-    if npm_module_installed 'nyc'; then npm run-script test-ci
+    # Legacy legs run the full mocha suite on the legacy runtime; the rest run
+    # the project's own test script, depending on nyc install
+    if [[ -n "$SEAL_LEGACY_BIN" ]]; then
+      "$SEAL_LEGACY_BIN/node" node_modules/mocha/bin/_mocha --reporter spec --bail --check-leaks --ui qunit test/
+    elif npm_module_installed 'nyc'; then npm run-script test-ci
     else npm test
     fi
   - |
     # Run linting, if eslint exists
     if npm_module_installed 'eslint'; then npm run-script lint
-    fi
-after_script:
-  - |
-    # Upload coverage to coveralls
-    if [[ -d .nyc_output ]]; then
-      npm install --save-dev coveralls@2
-      nyc report --reporter=text-lcov | coveralls
     fi
